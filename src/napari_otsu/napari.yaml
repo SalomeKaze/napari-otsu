@@ -1,0 +1,11 @@
+name: napari-otsu
+display_name: Segment by Otsu
+contributions:
+  commands:
+    - id: napari-otsu.make_qwidget
+      python_name: napari_otsu._widget:OtsuWidget
+      title: Otsu Segment
+  widgets:
+    - command: napari-otsu.make_qwidget
+      display_name: Otsu Segment
+
