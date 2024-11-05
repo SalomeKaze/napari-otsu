@@ -17,6 +17,8 @@ import warnings
 from tqdm import tqdm
 from superqt.utils import qdebounced
 
+from typing import Optional, Tuple
+
 import numbers
 
 import urllib.request
@@ -26,6 +28,7 @@ from os.path import join
 
 import cv2
 from skimage.filters import threshold_otsu
+from skimage import io, feature, color
 from skimage.segmentation import clear_border
 from typing import Optional, Tuple
 
@@ -142,9 +145,9 @@ class OtsuWidget(QWidget):
 
         self.layer_types = {"image": napari.layers.image.image.Image, "labels": napari.layers.labels.labels.Labels}
 
-        self.btn_load_model = QPushButton("Load model")
-        self.btn_load_model.clicked.connect(self._load_model)
-        main_layout.addWidget(self.btn_load_model)
+        # self.btn_load_model = QPushButton("Load model")
+        # self.btn_load_model.clicked.connect(self._load_model)
+        # main_layout.addWidget(self.btn_load_model)
 
         l_image_layer = QLabel("Select input image layer:")
         main_layout.addWidget(l_image_layer)
@@ -199,9 +202,14 @@ class OtsuWidget(QWidget):
         main_layout.addWidget(self.btn_mode_switch)
 
         self.check_prev_mask = QCheckBox ('Use Otsu')
-        self.check_prev_mask.setEnabled(False)
+        self.check_prev_mask.setEnabled(True)
         self.check_prev_mask.setChecked(True)
         main_layout.addWidget(self.check_prev_mask)
+
+        self.do_canny = QCheckBox ('Use Canny')
+        self.do_canny.setEnabled(True)
+        self.do_canny.setChecked(False)
+        main_layout.addWidget(self.do_canny)
 
         self.check_auto_inc_bbox= QCheckBox('Auto increment bounding box label')
         self.check_auto_inc_bbox.setEnabled(False)
@@ -506,8 +514,12 @@ class OtsuWidget(QWidget):
             self.btn_activate.setEnabled(False)
 
     def _load_model(self):
-        self.otsu_predictor = OtsuPredictor()
-        self._check_activate_btn()
+        if self.check_prev_mask.isChecked():
+            self.otsu_predictor = OtsuPredictor()
+            self._check_activate_btn()
+        elif self.do_canny.isChecked():
+            self.otsu_predictor = CannyEdgeDetector()
+            self._check_activate_btn()
 
     def _activate(self):
         self.btn_activate.setEnabled(False)
@@ -562,6 +574,7 @@ class OtsuWidget(QWidget):
                 self.cb_label_layers.setEnabled(False)
                 self.btn_mode_switch.setEnabled(True)
                 self.check_prev_mask.setEnabled(True)
+                self.do_canny.setEnabled(True)
                 self.check_auto_inc_bbox.setEnabled(True)
                 self.check_auto_inc_bbox.setChecked(True)
                 self.btn_mode_switch.setText("Switch to BBox Mode")
@@ -612,9 +625,14 @@ class OtsuWidget(QWidget):
                 self.label_layer.keymap['Control-Shift-Z'] = self.on_redo
 
             elif self.annotator_mode == AnnotatorMode.AUTO:
-                self.otsu_anything_predictor = OtsuPredictor()
-                prediction = self.predict_everything()
-                self.label_layer.data = prediction
+                if self.check_prev_mask.isChecked():
+                    self.otsu_anything_predictor = OtsuPredictor()
+                    prediction = self.predict_everything()
+                    self.label_layer.data = prediction
+                elif self.do_canny.isChecked():
+                    self.otsu_anything_predictor = CannyEdgeDetector()
+                    prediction = self.predict_everything()
+                    self.label_layer.data = prediction
         else:
             self._deactivate()
         self.btn_activate.setEnabled(True)
@@ -627,7 +645,8 @@ class OtsuWidget(QWidget):
         self.cb_label_layers.setEnabled(True)
         self.btn_mode_switch.setEnabled(False)
         self.btn_mode_switch.setText("Switch to BBox Mode")
-        self.check_prev_mask.setEnabled(False)
+        self.check_prev_mask.setEnabled(True)
+        self.do_canny.setEnabled(True)
         self.check_auto_inc_bbox.setEnabled(False)
         self.annotator_mode = AnnotatorMode.CLICK
 
@@ -650,6 +669,7 @@ class OtsuWidget(QWidget):
         self.bboxes = defaultdict(list)
         self.point_label = None
         self.otsu_logits = None
+        self.canny_logits = None
         self.rb_click.setEnabled(True)
         self.rb_auto.setEnabled(True)
         self.rb_click.setStyleSheet("")
@@ -895,6 +915,8 @@ class OtsuWidget(QWidget):
             logits = self.otsu_logits
             if not self.check_prev_mask.isChecked():
                 logits = None
+            if not self.do_canny.isChecked():
+                logits = None
             prediction = self.otsu_predictor.predict(
                 point_coords=points,
                 point_labels=labels,
@@ -920,6 +942,8 @@ class OtsuWidget(QWidget):
                 bbox = np.asarray(bbox).flatten()
             logits = self.otsu_logits[x_coord] 
             if not self.check_prev_mask.isChecked():
+                logits = None
+            if not self.do_canny.isChecked():
                 logits = None
             prediction_slice = self.otsu_predictor.predict(
                 point_coords=points,
@@ -1312,7 +1336,105 @@ class OtsuPredictor:
         return output_mask
 
 
+class CannyEdgeDetector:
+    def __init__(self) -> None:
+        """
+        Uses Canny edge detection to create an edge mask for an image.
+        """
+        super().__init__()
 
+    def set_image(
+        self,
+        image: np.ndarray,
+        image_format: str = "RGB",
+    ) -> None:
+        """
+        Prepares the image for Canny edge detection.
+
+        Arguments:
+          image (np.ndarray): The image for calculating edge masks. Expects a
+            grayscale or RGB image in HWC uint8 format, with pixel values in [0, 255].
+          image_format (str): The color format of the image, in ['RGB', 'BGR'].
+        """
+        assert image_format in ["RGB", "BGR"], "image_format must be in ['RGB', 'BGR']."
+        if image_format == "BGR":
+            image = image[..., ::-1]  # Convert BGR to RGB if necessary
+
+        # Convert to grayscale if the image is RGB
+        if image.ndim == 3:
+            image = color.rgb2gray(image)
+
+        self.image = image
+        self.original_size = image.shape[:2]
+        self.is_image_set = True
+
+    def create_bounding_box(self, point: Tuple[int, int], box_size: int = 20) -> Tuple[int, int, int, int]:
+        """
+        Creates a bounding box around a given point with a fixed size.
+
+        Arguments:
+        point (tuple): The (x, y) coordinates of the center point.
+        box_size (int): The size of the bounding box (defaults to 20 pixels).
+
+        Returns:
+        tuple: Bounding box coordinates as (x_min, y_min, x_max, y_max).
+        """
+        x, y = point
+        half_size = box_size // 2
+        x_min = max(x - half_size, 0)
+        y_min = max(y - half_size, 0)
+        x_max = min(x + half_size, self.original_size[1])
+        y_max = min(y + half_size, self.original_size[0])
+        return x_min, y_min, x_max, y_max
+    
+    def predict(
+        self,
+        point_coords: Optional[np.ndarray] = None,
+        box: Optional[np.ndarray] = None,
+        sigma: float = 1.0
+    ) -> np.ndarray:
+        """
+        Applies Canny edge detection to create an edge mask.
+
+        Arguments:
+          point_coords (np.ndarray or None): Coordinates for points of interest.
+          box (np.ndarray or None): Bounding box coordinates for region of interest.
+          sigma (float): Standard deviation for Gaussian filter in Canny edge detection.
+
+        Returns:
+          (np.ndarray): The output edge mask with the same dimensions as the input image.
+        """
+        if not self.is_image_set:
+            raise RuntimeError("An image must be set with .set_image(...) before edge detection.")
+
+        if point_coords is not None:
+            full_mask = np.zeros_like(self.image, dtype=np.uint8)
+            for point in point_coords:
+                bbox = self.create_bounding_box(point, box_size=20)
+                x_min, y_min, x_max, y_max = bbox
+
+                # Crop to bounding box
+                cropped_image = self.image[y_min:y_max, x_min:x_max]
+
+                # Apply Canny edge detection to the cropped region
+                edge_mask = feature.canny(cropped_image, sigma=sigma).astype(np.uint8) * 255
+
+                # Place the edge mask back into the full-size mask
+                full_mask[y_min:y_max, x_min:x_max] = edge_mask
+
+        elif box is not None:
+            x_min, y_min, x_max, y_max = box
+            cropped_image = self.image[y_min:y_max, x_min:x_max]  # Crop to bounding box
+            edge_mask = feature.canny(cropped_image, sigma=sigma).astype(np.uint8) * 255
+
+            full_mask = np.zeros_like(self.image, dtype=np.uint8)
+            full_mask[y_min:y_max, x_min:x_max] = edge_mask
+        else:
+            # Apply Canny edge detection on the whole image
+            edge_mask = feature.canny(self.image, sigma=sigma)
+            full_mask = edge_mask.astype(np.uint8) * 255
+
+        return full_mask
 
 
 
